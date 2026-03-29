@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+ARCHIVE_DIR="${HOME}/.log-archives"
+ACTIVITY_LOG="${ARCHIVE_DIR}/archive_activity.log"
+
+# Backblaze B2 rclone remote — set via env or edit here.
+# Format: <rclone-remote-name>:<bucket-name>[/optional-path]
+# Example: B2_REMOTE="b2:my-bucket/logs"
+B2_REMOTE="${B2_REMOTE:-}"
+
+# How many days to keep archives in the remote before pruning.
+BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    echo "${msg}"
+    echo "${msg}" >> "${ACTIVITY_LOG}"
+}
+
+# ─── Usage ────────────────────────────────────────────────────────────────────
+usage() {
+    echo "Usage: log-archive <log-directory> [--upload]"
+    echo
+    echo "  Compresses all logs in <log-directory> into a tar.gz archive"
+    echo "  and stores them under: ${ARCHIVE_DIR}"
+    echo
+    echo "Options:"
+    echo "  --upload   Upload the archive to Backblaze B2 and remove the local copy."
+    echo "             Requires B2_REMOTE env var (e.g. B2_REMOTE=b2:my-bucket/logs)"
+    echo "             and rclone to be installed and configured."
+    echo
+    echo "Environment variables:"
+    echo "  B2_REMOTE              rclone remote destination (required for --upload)"
+    echo "  BACKUP_RETENTION_DAYS  days to retain archives in B2 (default: 30)"
+    exit 1
+}
+
+# ─── Argument parsing ─────────────────────────────────────────────────────────
+UPLOAD=false
+LOG_DIR=""
+
+for arg in "$@"; do
+    case "${arg}" in
+        --upload) UPLOAD=true ;;
+        --help|-h) usage ;;
+        -*) echo "Error: unknown option '${arg}'." >&2; usage ;;
+        *)
+            if [[ -n "${LOG_DIR}" ]]; then
+                echo "Error: unexpected argument '${arg}'." >&2; usage
+            fi
+            LOG_DIR="${arg}"
+            ;;
+    esac
+done
+
+if [[ -z "${LOG_DIR}" ]]; then
+    echo "Error: <log-directory> is required." >&2
+    usage
+fi
+
+if [[ ! -d "${LOG_DIR}" ]]; then
+    echo "Error: '${LOG_DIR}' is not a directory or does not exist." >&2
+    exit 1
+fi
+
+if [[ ! -r "${LOG_DIR}" ]]; then
+    echo "Error: no read permission on '${LOG_DIR}'." >&2
+    exit 1
+fi
+
+if ${UPLOAD} && [[ -z "${B2_REMOTE}" ]]; then
+    echo "Error: --upload requires the B2_REMOTE environment variable to be set." >&2
+    echo "  Example: B2_REMOTE=b2:my-bucket/logs log-archive /var/log --upload" >&2
+    exit 1
+fi
+
+if ${UPLOAD} && ! command -v rclone &>/dev/null; then
+    echo "Error: rclone is not installed or not in PATH." >&2
+    exit 1
+fi
+
+# ─── Pre-flight summary ───────────────────────────────────────────────────────
+echo
+echo "┌─────────────────────────────────────────────────────────┐"
+echo "│              log-archive — execution plan               │"
+echo "├─────────────────────────────────────────────────────────┤"
+printf "│  %-20s %-35s │\n" "Source directory:"  "${LOG_DIR}"
+printf "│  %-20s %-35s │\n" "Archive store:"     "${ARCHIVE_DIR}"
+
+if ${UPLOAD}; then
+    printf "│  %-20s %-35s │\n" "Upload:"        "YES → ${B2_REMOTE}"
+    printf "│  %-20s %-35s │\n" "Retention:"     "${BACKUP_RETENTION_DAYS} days (remote)"
+    printf "│  %-20s %-35s │\n" "Local cleanup:" "local archive removed after upload"
+else
+    printf "│  %-20s %-35s │\n" "Upload:"        "NO  (pass --upload to enable)"
+    printf "│  %-20s %-35s │\n" "Local cleanup:" "archive kept in store directory"
+fi
+
+echo "└─────────────────────────────────────────────────────────┘"
+echo
+
+read -r -p "Proceed? [y/N] " CONFIRM
+case "${CONFIRM}" in
+    [yY][eE][sS]|[yY]) ;;
+    *)
+        echo "Aborted."
+        exit 0
+        ;;
+esac
+echo
+
+# ─── Prepare archive directory ────────────────────────────────────────────────
+mkdir -p "${ARCHIVE_DIR}"
+
+# ─── Build archive filename with timestamp ────────────────────────────────────
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+ARCHIVE_NAME="logs_archive_${TIMESTAMP}.tar.gz"
+ARCHIVE_PATH="${ARCHIVE_DIR}/${ARCHIVE_NAME}"
+
+# Dedicated rclone log for this run (kept even after local cleanup)
+RCLONE_LOG="${ARCHIVE_DIR}/rclone_${TIMESTAMP}.log"
+
+# ─── Compress logs ────────────────────────────────────────────────────────────
+log "=== Log archive started ==="
+log "Source directory : ${LOG_DIR}"
+log "Compressing logs ..."
+
+tar -czf "${ARCHIVE_PATH}" -C "$(dirname "${LOG_DIR}")" "$(basename "${LOG_DIR}")"
+
+ARCHIVE_SIZE="$(du -sh "${ARCHIVE_PATH}" | cut -f1)"
+log "Archive created  : ${ARCHIVE_PATH} (${ARCHIVE_SIZE})"
+
+# ─── Optional: upload to Backblaze B2 ────────────────────────────────────────
+if ${UPLOAD}; then
+    log "Uploading to Backblaze B2 remote '${B2_REMOTE}' ..."
+
+    rclone copy "${ARCHIVE_PATH}" "${B2_REMOTE}" \
+        --log-file="${RCLONE_LOG}" \
+        --log-level=DEBUG \
+        --log-format="date,time,microseconds" \
+        --stats=10s \
+        --stats-log-level=INFO \
+        --retries=3 \
+        --low-level-retries=10
+
+    log "Upload complete. rclone log: ${RCLONE_LOG}"
+
+    # Apply remote retention: delete archives older than BACKUP_RETENTION_DAYS days
+    log "Applying remote retention policy (${BACKUP_RETENTION_DAYS} days) ..."
+
+    rclone delete "${B2_REMOTE}" \
+        --min-age "${BACKUP_RETENTION_DAYS}d" \
+        --include "logs_archive_*.tar.gz" \
+        --log-file="${RCLONE_LOG}" \
+        --log-format="date,time,microseconds"
+
+    log "Remote retention applied."
+
+    # Remove the local archive now that it is safely in the cloud
+    log "Removing local archive to free disk space ..."
+    rm -f "${ARCHIVE_PATH}"
+    log "Local archive removed."
+fi
+
+# ─── Write summary to activity log ───────────────────────────────────────────
+log "uploaded=${UPLOAD} source='${LOG_DIR}' archive='${ARCHIVE_NAME}' size=${ARCHIVE_SIZE} remote='${B2_REMOTE:-none}' retention=${BACKUP_RETENTION_DAYS}d"
+log "=== Log archive completed ==="
+echo "Activity logged to: ${ACTIVITY_LOG}"
